@@ -8,17 +8,332 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <ctype.h>
+#include <sys/resource.h>
 
-#define MAX_ARGS 6
+#define MAX_ARGS 40
 #define MAX_CMD_LEN 1024
 #define MAX_BG_PROCESSES 100
+#define MAX_RLIMITS 10
+#define RLIMIT_NAME_LEN 16
+#define RLIMIT_VALUE_LEN 32
 
-pid_t bg_pids[MAX_BG_PROCESSES];
+pid_t bg_pids[MAX_BG_PROCESSES] = {0};
 int bg_count = 0;
 
 int dangerous_cmd_blocked = 0;
 char ***dangerous_commands = NULL;
 int danger_count = 0;
+
+typedef struct {
+    int resource;
+    char name[RLIMIT_NAME_LEN];
+    rlim_t soft_limit;
+    rlim_t hard_limit;
+} ShellRLimit;
+
+ShellRLimit active_limits[MAX_RLIMITS] = {0};
+int active_limit_count = 0;
+
+int get_rlimit_resource(const char *name) {
+    if (strcmp(name, "cpu") == 0) return RLIMIT_CPU;
+    if (strcmp(name, "mem") == 0) return RLIMIT_AS;
+    if (strcmp(name, "fsize") == 0) return RLIMIT_FSIZE;
+
+    if (strcmp(name, "nproc") == 0 ||
+        strcmp(name, "data") == 0 ||
+        strcmp(name, "stack") == 0 ||
+        strcmp(name, "nofile") == 0) {
+        fprintf(stderr, "Resource '%s' is not supported. Only cpu, mem, and fsize are supported.\n", name);
+        return -1;
+        }
+
+    fprintf(stderr, "Unknown resource: %s\n", name);
+    return -1;
+}
+
+rlim_t parse_rlimit_value(const char *str) {
+    if (strcmp(str, "unlimited") == 0 || strcmp(str, "inf") == 0) {
+        return RLIM_INFINITY;
+    }
+
+    char *end;
+    rlim_t value = strtoull(str, &end, 10);
+
+    if (*end) {
+        switch (*end) {
+            case 'K':
+            case 'k':
+                value *= 1024;
+                break;
+            case 'M':
+            case 'm':
+                value *= 1024 * 1024;
+                break;
+            case 'G':
+            case 'g':
+                value *= 1024 * 1024 * 1024;
+                break;
+            case 's':
+                break;
+            default:
+                fprintf(stderr, "Invalid unit in value: %s\n", str);
+                return RLIM_INFINITY;
+        }
+    }
+
+    return value;
+}
+
+const char *get_rlimit_name(int resource) {
+    switch (resource) {
+        case RLIMIT_CPU: return "CPU time";
+        case RLIMIT_AS: return "Memory size";
+        case RLIMIT_FSIZE: return "File size";
+        case RLIMIT_NPROC: return "Process count";
+        case RLIMIT_DATA: return "Data size";
+        case RLIMIT_STACK: return "Stack size";
+        case RLIMIT_NOFILE: return "File descriptors";
+        default: return "Unknown";
+    }
+}
+
+void format_rlimit_value(char *buf, size_t bufsize, rlim_t value) {
+    if (value == RLIM_INFINITY) {
+        snprintf(buf, bufsize, "unlimited");
+    } else {
+        const char *unit = "";
+        double display_value = value;
+
+        if (value >= 1024*1024*1024) {
+            display_value /= 1024*1024*1024;
+            unit = "G";
+        } else if (value >= 1024*1024) {
+            display_value /= 1024*1024;
+            unit = "M";
+        } else if (value >= 1024) {
+            display_value /= 1024;
+            unit = "K";
+        }
+
+        snprintf(buf, bufsize, "%.0f%s", display_value, unit);
+    }
+}
+
+
+void show_rlimits() {
+    struct rlimit rlim = {0};
+    char soft_buf[RLIMIT_VALUE_LEN];
+    char hard_buf[RLIMIT_VALUE_LEN];
+
+    const int resources[] = {
+        RLIMIT_CPU, RLIMIT_AS, RLIMIT_FSIZE, RLIMIT_NOFILE
+    };
+
+    const char *resource_labels[] = {
+        "CPU time:", "Memory limit:", "File size:", "Open files:"
+    };
+
+    for (size_t i = 0; i < sizeof(resources)/sizeof(resources[0]); i++) {
+        if (getrlimit(resources[i], &rlim) == 0) {
+            if (resources[i] == RLIMIT_CPU) {
+
+                if (rlim.rlim_cur == RLIM_INFINITY)
+                    snprintf(soft_buf, RLIMIT_VALUE_LEN, "unlimited");
+                else
+                    snprintf(soft_buf, RLIMIT_VALUE_LEN, "%lus", (unsigned long)rlim.rlim_cur);
+
+                if (rlim.rlim_max == RLIM_INFINITY)
+                    snprintf(hard_buf, RLIMIT_VALUE_LEN, "unlimited");
+                else
+                    snprintf(hard_buf, RLIMIT_VALUE_LEN, "%lus", (unsigned long)rlim.rlim_max);
+            }
+            else if (resources[i] == RLIMIT_NOFILE) {
+
+                if (rlim.rlim_cur == RLIM_INFINITY)
+                    snprintf(soft_buf, RLIMIT_VALUE_LEN, "unlimited");
+                else
+                    snprintf(soft_buf, RLIMIT_VALUE_LEN, "%lu", (unsigned long)rlim.rlim_cur);
+
+                if (rlim.rlim_max == RLIM_INFINITY)
+                    snprintf(hard_buf, RLIMIT_VALUE_LEN, "unlimited");
+                else
+                    snprintf(hard_buf, RLIMIT_VALUE_LEN, "%lu", (unsigned long)rlim.rlim_max);
+            }
+            else {
+                if (rlim.rlim_cur == RLIM_INFINITY)
+                    snprintf(soft_buf, RLIMIT_VALUE_LEN, "unlimited");
+                else {
+                    if (rlim.rlim_cur >= 1024*1024*1024)
+                        snprintf(soft_buf, RLIMIT_VALUE_LEN, "%luG", (unsigned long)(rlim.rlim_cur / (1024*1024*1024)));
+                    else if (rlim.rlim_cur >= 1024*1024)
+                        snprintf(soft_buf, RLIMIT_VALUE_LEN, "%luM", (unsigned long)(rlim.rlim_cur / (1024*1024)));
+                    else if (rlim.rlim_cur >= 1024)
+                        snprintf(soft_buf, RLIMIT_VALUE_LEN, "%luK", (unsigned long)(rlim.rlim_cur / 1024));
+                    else
+                        snprintf(soft_buf, RLIMIT_VALUE_LEN, "%lu", (unsigned long)rlim.rlim_cur);
+                }
+
+                if (rlim.rlim_max == RLIM_INFINITY)
+                    snprintf(hard_buf, RLIMIT_VALUE_LEN, "unlimited");
+                else {
+                    if (rlim.rlim_max >= 1024*1024*1024)
+                        snprintf(hard_buf, RLIMIT_VALUE_LEN, "%luG", (unsigned long)(rlim.rlim_max / (1024*1024*1024)));
+                    else if (rlim.rlim_max >= 1024*1024)
+                        snprintf(hard_buf, RLIMIT_VALUE_LEN, "%luM", (unsigned long)(rlim.rlim_max / (1024*1024)));
+                    else if (rlim.rlim_max >= 1024)
+                        snprintf(hard_buf, RLIMIT_VALUE_LEN, "%luK", (unsigned long)(rlim.rlim_max / 1024));
+                    else
+                        snprintf(hard_buf, RLIMIT_VALUE_LEN, "%lu", (unsigned long)rlim.rlim_max);
+                }
+            }
+
+
+            printf("%s soft=%s, hard=%s\n", resource_labels[i], soft_buf, hard_buf);
+        }
+    }
+}
+
+
+int set_rlimit(const char *resource_str, const char *value_str) {
+    int resource = get_rlimit_resource(resource_str);
+    if (resource == -1) {
+        return -1;
+    }
+
+    char *colon = strchr(value_str, ':');
+    rlim_t soft, hard;
+
+    if (colon) {
+        char temp_value[RLIMIT_VALUE_LEN];
+        strncpy(temp_value, value_str, sizeof(temp_value) - 1);
+        temp_value[sizeof(temp_value) - 1] = '\0';
+
+        char *temp_colon = strchr(temp_value, ':');
+        *temp_colon = '\0';
+
+        soft = parse_rlimit_value(temp_value);
+        hard = parse_rlimit_value(temp_colon + 1);
+    } else {
+        soft = hard = parse_rlimit_value(value_str);
+    }
+
+    for (int i = 0; i < active_limit_count; i++) {
+        if (active_limits[i].resource == resource) {
+            active_limits[i].soft_limit = soft;
+            active_limits[i].hard_limit = hard;
+            return 0;
+        }
+    }
+
+    if (active_limit_count >= MAX_RLIMITS) {
+        fprintf(stderr, "Too many active limits\n");
+        return -1;
+    }
+
+    strncpy(active_limits[active_limit_count].name, resource_str, RLIMIT_NAME_LEN - 1);
+    active_limits[active_limit_count].name[RLIMIT_NAME_LEN - 1] = '\0';
+    active_limits[active_limit_count].resource = resource;
+    active_limits[active_limit_count].soft_limit = soft;
+    active_limits[active_limit_count].hard_limit = hard;
+    active_limit_count++;
+
+    return 0;
+}
+
+void apply_rlimits() {
+    struct rlimit rlim;
+
+    for (int i = 0; i < active_limit_count; i++) {
+        rlim.rlim_cur = active_limits[i].soft_limit;
+        rlim.rlim_max = active_limits[i].hard_limit;
+
+        if (setrlimit(active_limits[i].resource, &rlim) != 0) {
+            fprintf(stderr, "Failed to set %s limit: %s\n",
+                   active_limits[i].name, strerror(errno));
+        }
+    }
+}
+
+int parse_multiple_rlimits(char **args, int start_idx) {
+    int i = start_idx;
+    int success_count = 0;
+
+    while (args[i] != NULL) {
+        char *eq = strchr(args[i], '=');
+        if (!eq) {
+            break;
+        }
+
+        *eq = '\0';
+        const char *resource = args[i];
+        const char *value = eq + 1;
+
+        if (set_rlimit(resource, value) == 0) {
+            success_count++;
+        } else {
+            fprintf(stderr, "Failed to set limit for %s\n", resource);
+        }
+
+        *eq = '=';
+        i++;
+    }
+
+    return success_count;
+}
+
+int apply_rlimits_to_self() {
+    struct rlimit rlim;
+    int failure_count = 0;
+
+    for (int i = 0; i < active_limit_count; i++) {
+        rlim.rlim_cur = active_limits[i].soft_limit;
+        rlim.rlim_max = active_limits[i].hard_limit;
+
+        if (setrlimit(active_limits[i].resource, &rlim) != 0) {
+            fprintf(stderr, "Failed to set %s limit: %s\n",
+                    active_limits[i].name, strerror(errno));
+            failure_count++;
+        }
+    }
+
+    return (failure_count == 0) ? 0 : -1;
+}
+
+
+
+void handle_limit_exceeded(int status) {
+    if (WIFSIGNALED(status)) {
+        switch (WTERMSIG(status)) {
+            case SIGXCPU:
+                printf("CPU time limit exceeded!\n");
+                break;
+            case SIGXFSZ:
+                printf("File size limit exceeded!\n");
+                break;
+            case SIGSEGV:
+                if (active_limit_count > 0) {
+                    for (int i = 0; i < active_limit_count; i++) {
+                        if (active_limits[i].resource == RLIMIT_AS &&
+                            active_limits[i].soft_limit != RLIM_INFINITY) {
+                            printf("Memory limit exceeded!\n");
+                            break;
+                            }
+                    }
+                }
+                break;
+        }
+    } else if (WIFEXITED(status)) {
+        for (int i = 0; i < active_limit_count; i++) {
+            if (active_limits[i].resource == RLIMIT_CPU &&
+                active_limits[i].soft_limit != RLIM_INFINITY) {
+                printf("Process completed within CPU time limit\n");
+                break;
+                }
+        }
+    }
+}
+
 
 void print_command(char **cmd_args, FILE *output) {
     fprintf(output, "(\"");
@@ -141,18 +456,15 @@ char **parse_command(char *input, int *run_in_background) {
         input[len - 1] = '\0';
     }
 
-    // Skip leading whitespace
     char *start = input;
     while (*start == ' ' || *start == '\t') start++;
 
-    // Skip trailing whitespace
     char *end = start + strlen(start) - 1;
     while (end > start && (*end == ' ' || *end == '\t')) {
         *end = '\0';
         end--;
     }
 
-    // Return NULL for empty/whitespace-only commands
     if (strlen(start) == 0) {
         return NULL;
     }
@@ -190,30 +502,88 @@ char **parse_command(char *input, int *run_in_background) {
     return args;
 }
 
+char* normalize_filename(const char* raw_filename) {
+    if (!raw_filename) {
+        return NULL;
+    }
+
+    const char *start = raw_filename;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+
+    if (*start == '\0') {
+        return NULL;
+    }
+
+    const char *end = start + strlen(start) - 1;
+    while (end >= start && isspace((unsigned char)*end)) {
+        end--;
+    }
+
+
+    if (end < start) {
+        return NULL;
+    }
+
+    size_t len = (end - start) + 1;
+
+    char *normalized = (char *)malloc(len + 1);
+    if (!normalized) {
+        perror("normalize_filename: malloc failed");
+        return NULL;
+    }
+
+    strncpy(normalized, start, len);
+    normalized[len] = '\0';
+
+    return normalized;
+}
+
 int handle_stderr_redirection_input(char *input) {
-    char *redir_pos = strstr(input, "2>");
-    if (!redir_pos) return -1;
+    char *redir_pos_marker = strstr(input, "2>");
+    if (!redir_pos_marker) return -1;
 
-    *redir_pos = '\0';
-    redir_pos += 2;
-    while (*redir_pos == ' ') redir_pos++;
+    *redir_pos_marker = '\0';
 
-    char *filename = redir_pos;
-    while (*redir_pos && *redir_pos != ' ') redir_pos++;
-    *redir_pos = '\0';
+    char *filename_extraction_ptr = redir_pos_marker + 2;
+    while (*filename_extraction_ptr == ' ') filename_extraction_ptr++;
 
-    int fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+    char *raw_filename_from_input = filename_extraction_ptr;
+
+
+    char *end_of_raw_filename = filename_extraction_ptr;
+    while (*end_of_raw_filename && *end_of_raw_filename != ' ') {
+        end_of_raw_filename++;
+    }
+    if (*end_of_raw_filename == ' ') {
+        *end_of_raw_filename = '\0';
+    }
+
+    char* normalized_filename = normalize_filename(raw_filename_from_input);
+
+    if (!normalized_filename) {
+        fprintf(stderr, "Error: Invalid or empty filename for stderr redirection after normalization.\n");
+        return -1;
+    }
+
+    int fd = open(normalized_filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    free(normalized_filename);
+
     if (fd < 0) {
-        perror("Failed to open stderr file");
+        perror("Failed to open stderr file (after normalization)");
         return -1;
     }
     return fd;
 }
 
+
 int handle_stderr_redirection_args(char **args, int *stderr_fd) {
     for (int i = 0; args[i]; i++) {
         if (strcmp(args[i], "2>") == 0 && args[i + 1]) {
-            *stderr_fd = open(args[i + 1], O_WRONLY | O_CREAT | O_APPEND, 0644);
+            *stderr_fd = open(args[i + 1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (*stderr_fd < 0) {
                 perror("Failed to open stderr file");
                 return -1;
@@ -237,8 +607,9 @@ void update_statistics(double elapsed_time, int *cmd_count, double *last_cmd_tim
                       double *avg_time, double *min_time, double *max_time, int success) {
     if (!success) return;
 
-    (*cmd_count)++;
     *last_cmd_time = elapsed_time;
+
+    (*cmd_count)++;
 
     if (*cmd_count == 1) {
         *avg_time = elapsed_time;
@@ -246,6 +617,7 @@ void update_statistics(double elapsed_time, int *cmd_count, double *last_cmd_tim
         *max_time = elapsed_time;
     } else {
         *avg_time = ((*avg_time) * (*cmd_count - 1) + elapsed_time) / (*cmd_count);
+
         if (elapsed_time < *min_time) {
             *min_time = elapsed_time;
         }
@@ -254,6 +626,8 @@ void update_statistics(double elapsed_time, int *cmd_count, double *last_cmd_tim
         }
     }
 }
+
+
 
 void execute_command(char **cmd_args, int run_in_background, FILE *output_file,
                     int *cmd_count, double *last_cmd_time, double *avg_time,
@@ -277,8 +651,12 @@ void execute_command(char **cmd_args, int run_in_background, FILE *output_file,
             dup2(stderr_fd, STDERR_FILENO);
             close(stderr_fd);
         }
+
+        apply_rlimits();
+
         execvp(cmd_args[0], cmd_args);
-        perror("Execution failed");
+
+        fprintf(stderr, "Failed to execute '%s': %s\n", cmd_args[0], strerror(errno));
         _exit(EXIT_FAILURE);
     } else {
         if (stderr_fd != -1) close(stderr_fd);
@@ -287,8 +665,6 @@ void execute_command(char **cmd_args, int run_in_background, FILE *output_file,
             if (bg_count < MAX_BG_PROCESSES) {
                 bg_pids[bg_count++] = pid;
             }
-            printf("Started background process with PID %d\n", pid);
-            fflush(stdout);
 
             clock_gettime(CLOCK_MONOTONIC, &end);
             double elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -310,19 +686,117 @@ void execute_command(char **cmd_args, int run_in_background, FILE *output_file,
         int success = WIFEXITED(status) && WEXITSTATUS(status) == 0;
         update_statistics(elapsed_time, cmd_count, last_cmd_time, avg_time, min_time, max_time, success);
 
-        if (WIFEXITED(status)) {
+        if (WIFSIGNALED(status)) {
+            switch (WTERMSIG(status)) {
+                case SIGXCPU:
+                    printf("CPU time limit exceeded!\n");
+                    break;
+                case SIGXFSZ:
+                    printf("File size limit exceeded!\n");
+                    break;
+                case SIGSEGV:
+                    for (int i = 0; i < active_limit_count; i++) {
+                        if (active_limits[i].resource == RLIMIT_AS &&
+                            active_limits[i].soft_limit != RLIM_INFINITY) {
+                            printf("Memory limit exceeded!\n");
+                            break;
+                        }
+                    }
+                    break;
+                default:
+                    printf("Process terminated by signal %d\n", WTERMSIG(status));
+                    break;
+            }
+        } else if (WIFEXITED(status)) {
+            if (WEXITSTATUS(status) == 1) {
+                for (int i = 0; i < active_limit_count; i++) {
+                    if (active_limits[i].resource == RLIMIT_FSIZE) {
+                        printf("File size limit exceeded!\n");
+                        break;
+                    }
+                }
+            }
+
             if (WEXITSTATUS(status) == 0) {
                 printf("Process exited successfully\n");
             } else {
                 printf("Process exited with error code %d\n", WEXITSTATUS(status));
             }
-        } else if (WIFSIGNALED(status)) {
-            printf("Process terminated by signal %d\n", WTERMSIG(status));
         }
 
         fprintf(output_file, "Command: ");
         for (int i = 0; cmd_args[i] != NULL; i++) {
             fprintf(output_file, "%s ", cmd_args[i]);
+        }
+        fprintf(output_file, ": %.5f sec\n", elapsed_time);
+        fflush(output_file);
+    }
+}
+
+void handle_rlimit_command(char **args, int run_in_background, FILE *output_file,
+                          int *cmd_count, double *last_cmd_time, double *avg_time,
+                          double *min_time, double *max_time) {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int success = 0;
+
+    if (args[1] == NULL) {
+        fprintf(stderr, "Usage: rlimit [show|set resource=value[:value] [command]]\n");
+    } else if (strcmp(args[1], "show") == 0) {
+        show_rlimits();
+        success = 1;
+    } else if (strcmp(args[1], "set") == 0) {
+        if (args[2] == NULL) {
+            fprintf(stderr, "Usage: rlimit set resource=value[:value] [resource=value[:value] ...] [command]\n");
+        } else {
+            int limit_count = parse_multiple_rlimits(args, 2);
+
+            if (limit_count > 0) {
+                int cmd_idx = 2;
+                while (args[cmd_idx] != NULL && strchr(args[cmd_idx], '=') != NULL) {
+                    cmd_idx++;
+                }
+
+                if (args[cmd_idx] != NULL) {
+                    char **new_args = malloc((MAX_ARGS + 1) * sizeof(char *));
+                    if (!new_args) {
+                        perror("malloc");
+                    } else {
+                        int new_argc = 0;
+                        for (int i = cmd_idx; args[i] != NULL && new_argc < MAX_ARGS; i++) {
+                            new_args[new_argc++] = strdup(args[i]);
+                        }
+                        new_args[new_argc] = NULL;
+
+                        execute_command(new_args, run_in_background, output_file,
+                                       cmd_count, last_cmd_time, avg_time,
+                                       min_time, max_time);
+                        free_command_args(new_args);
+
+                        clock_gettime(CLOCK_MONOTONIC, &end);
+                        return;
+                    }
+                } else {
+                    apply_rlimits_to_self();
+                    success = 1;
+                }
+            }
+        }
+    } else {
+        fprintf(stderr, "Invalid rlimit command\n");
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    if (success) {
+        update_statistics(elapsed_time, cmd_count, last_cmd_time, avg_time, min_time, max_time, 1);
+    }
+
+    if (success) {
+        fprintf(output_file, "Command: ");
+        for (int i = 0; args[i] != NULL; i++) {
+            fprintf(output_file, "%s ", args[i]);
         }
         fprintf(output_file, ": %.5f sec\n", elapsed_time);
         fflush(output_file);
@@ -354,7 +828,7 @@ void sigchld_handler(int signum) {
 }
 
 void handle_pipe(char *input, FILE *output_file, int *cmd_count, double *last_cmd_time,
-                double *avg_time, double *min_time, double *max_time) {
+                double *avg_time, double *min_time, double *max_time, int *warning_cmd_count) {
     int stderr_fd = handle_stderr_redirection_input(input);
     char *pipe_pos = strchr(input, '|');
     if (!pipe_pos) {
@@ -379,6 +853,19 @@ void handle_pipe(char *input, FILE *output_file, int *cmd_count, double *last_cm
         printf("Error: Invalid commands in pipe.\n");
         if (left_args) free_command_args(left_args);
         if (right_args) free_command_args(right_args);
+        if (stderr_fd != -1) close(stderr_fd);
+        return;
+    }
+
+    int left_danger = check_dangerous_command(left_args, warning_cmd_count);
+    int right_danger = check_dangerous_command(right_args, warning_cmd_count);
+
+    if (left_danger == -1) dangerous_cmd_blocked++;
+    if (right_danger == -1) dangerous_cmd_blocked++;
+
+    if (left_danger == -1 || right_danger == -1) {
+        free_command_args(left_args);
+        free_command_args(right_args);
         if (stderr_fd != -1) close(stderr_fd);
         return;
     }
@@ -414,6 +901,9 @@ void handle_pipe(char *input, FILE *output_file, int *cmd_count, double *last_cm
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
+
+        apply_rlimits();
+
         execvp(left_args[0], left_args);
         perror("Execution failed for left command");
         _exit(EXIT_FAILURE);
@@ -438,6 +928,9 @@ void handle_pipe(char *input, FILE *output_file, int *cmd_count, double *last_cm
         close(pipefd[1]);
         dup2(pipefd[0], STDIN_FILENO);
         close(pipefd[0]);
+
+        apply_rlimits();
+
         execvp(right_args[0], right_args);
         perror("Execution failed for right command");
         _exit(EXIT_FAILURE);
@@ -454,24 +947,35 @@ void handle_pipe(char *input, FILE *output_file, int *cmd_count, double *last_cm
     clock_gettime(CLOCK_MONOTONIC, &end);
     double elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
-    int success = WIFEXITED(left_status) && WEXITSTATUS(left_status) == 0 &&
-                 WIFEXITED(right_status) && WEXITSTATUS(right_status) == 0;
-    update_statistics(elapsed_time, cmd_count, last_cmd_time, avg_time, min_time, max_time, success);
+    int left_success = WIFEXITED(left_status) && WEXITSTATUS(left_status) == 0;
+    int right_success = WIFEXITED(right_status) && WEXITSTATUS(right_status) == 0;
+
+    if (left_success) {
+        update_statistics(elapsed_time, cmd_count, last_cmd_time, avg_time, min_time, max_time, 1);
+    }
+
+    if (right_success) {
+        update_statistics(elapsed_time, cmd_count, last_cmd_time, avg_time, min_time, max_time, 1);
+    }
 
     fprintf(output_file, "Pipe: \"%s\" | \"%s\" : %.5f sec\n", left, right, elapsed_time);
     fflush(output_file);
 
-    if (!success) {
-        if (WIFEXITED(left_status) && WEXITSTATUS(left_status) != 0) {
+    if (!left_success) {
+        if (WIFEXITED(left_status)) {
             printf("Left command failed with exit code %d\n", WEXITSTATUS(left_status));
         } else if (WIFSIGNALED(left_status)) {
             printf("Left command terminated by signal %d\n", WTERMSIG(left_status));
+            handle_limit_exceeded(left_status);
         }
+    }
 
-        if (WIFEXITED(right_status) && WEXITSTATUS(right_status) != 0) {
+    if (!right_success) {
+        if (WIFEXITED(right_status)) {
             printf("Right command failed with exit code %d\n", WEXITSTATUS(right_status));
         } else if (WIFSIGNALED(right_status)) {
             printf("Right command terminated by signal %d\n", WTERMSIG(right_status));
+            handle_limit_exceeded(right_status);
         }
     }
 
@@ -480,7 +984,7 @@ void handle_pipe(char *input, FILE *output_file, int *cmd_count, double *last_cm
 }
 
 void handle_pipe_with_my_tee(char *input, int *cmd_count, double *last_cmd_time,
-                            double *avg_time, double *min_time, double *max_time) {
+                            double *avg_time, double *min_time, double *max_time, int *warning_cmd_count) {
     int stderr_fd = handle_stderr_redirection_input(input);
     char *pipe_pos = strchr(input, '|');
     if (!pipe_pos) {
@@ -517,6 +1021,18 @@ void handle_pipe_with_my_tee(char *input, int *cmd_count, double *last_cmd_time,
         printf("Error: Invalid commands in pipe with my_tee.\n");
         if (left_args) free_command_args(left_args);
         if (my_tee_args) free_command_args(my_tee_args);
+        close(original_stdin);
+        if (stderr_fd != -1) close(stderr_fd);
+        return;
+    }
+
+    int left_danger = check_dangerous_command(left_args, warning_cmd_count);
+    int right_danger = check_dangerous_command(my_tee_args, warning_cmd_count);
+
+    if (left_danger == -1 || right_danger == -1) {
+        dangerous_cmd_blocked++;
+        free_command_args(left_args);
+        free_command_args(my_tee_args);
         close(original_stdin);
         if (stderr_fd != -1) close(stderr_fd);
         return;
@@ -562,6 +1078,9 @@ void handle_pipe_with_my_tee(char *input, int *cmd_count, double *last_cmd_time,
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
+
+        apply_rlimits();
+
         execvp(left_args[0], left_args);
         perror("Execution failed for left command");
         _exit(EXIT_FAILURE);
@@ -600,17 +1119,20 @@ void handle_pipe_with_my_tee(char *input, int *cmd_count, double *last_cmd_time,
         }
     }
 
+    int my_tee_success = 1;
     char buffer[1024];
     ssize_t bytes_read;
     while ((bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer))) > 0) {
         if (write(STDOUT_FILENO, buffer, bytes_read) < 0) {
             perror("Error writing to stdout");
+            my_tee_success = 0;
         }
 
         for (int i = 0; i < file_count; i++) {
             if (file_fds[i] >= 0) {
                 if (write(file_fds[i], buffer, bytes_read) < 0) {
                     perror("Error writing to file");
+                    my_tee_success = 0;
                 }
             }
         }
@@ -637,17 +1159,31 @@ void handle_pipe_with_my_tee(char *input, int *cmd_count, double *last_cmd_time,
     double elapsed_time = (end_time.tv_sec - start_time.tv_sec) +
                          (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
-    int success = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    update_statistics(elapsed_time, cmd_count, last_cmd_time, avg_time, min_time, max_time, success);
+    int left_success = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+
+    if (left_success) {
+        update_statistics(elapsed_time, cmd_count, last_cmd_time, avg_time, min_time, max_time, 1);
+    }
+
+    if (my_tee_success) {
+        update_statistics(elapsed_time, cmd_count, last_cmd_time, avg_time, min_time, max_time, 1);
+    }
 
     if (WIFEXITED(status)) {
         if (WEXITSTATUS(status) == 0) {
-            printf("Process exited successfully\n");
+            printf("Left command exited successfully\n");
         } else {
-            printf("Process exited with error code %d\n", WEXITSTATUS(status));
+            printf("Left command exited with error code %d\n", WEXITSTATUS(status));
         }
     } else if (WIFSIGNALED(status)) {
-        printf("Process terminated by signal %d\n", WTERMSIG(status));
+        printf("Left command terminated by signal %d\n", WTERMSIG(status));
+        handle_limit_exceeded(status);
+    }
+
+    if (my_tee_success) {
+        printf("my_tee command completed successfully\n");
+    } else {
+        printf("my_tee command encountered errors\n");
     }
 
     free_command_args(left_args);
@@ -708,7 +1244,6 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Check for empty or whitespace-only input
         int all_spaces = 1;
         for (char *p = input; *p && *p != '\n'; p++) {
             if (*p != ' ' && *p != '\t') {
@@ -721,12 +1256,12 @@ int main(int argc, char *argv[]) {
         }
 
         if (strstr(input, "my_tee") && strchr(input, '|')) {
-            handle_pipe_with_my_tee(input, &cmd_count, &last_cmd_time, &avg_time, &min_time, &max_time);
+            handle_pipe_with_my_tee(input, &cmd_count, &last_cmd_time, &avg_time, &min_time, &max_time, &warning_cmd_count);
             continue;
         }
 
         if (strchr(input, '|')) {
-            handle_pipe(input, output_file, &cmd_count, &last_cmd_time, &avg_time, &min_time, &max_time);
+            handle_pipe(input, output_file, &cmd_count, &last_cmd_time, &avg_time, &min_time, &max_time, &warning_cmd_count);
             continue;
         }
 
@@ -741,25 +1276,25 @@ int main(int argc, char *argv[]) {
             printf(" %d\n", illegal_cmd_count);
             free_command_args(args);
             break;
-        }
+        } else if (strcmp(args[0], "rlimit") == 0) {
+            handle_rlimit_command(args, run_in_background, output_file, &cmd_count,
+                               &last_cmd_time, &avg_time, &min_time, &max_time);
+        } else {
+            int danger_check = check_dangerous_command(args, &warning_cmd_count);
+            if (danger_check == -1) {
+                dangerous_cmd_blocked++;
+                free_command_args(args);
+                continue;
+            }
 
-        int danger_check = check_dangerous_command(args, &warning_cmd_count);
-        if (danger_check == -1) {
-            dangerous_cmd_blocked++;
-            free_command_args(args);
-            continue;
+            execute_command(args, run_in_background, output_file, &cmd_count,
+                          &last_cmd_time, &avg_time, &min_time, &max_time);
         }
-
-        execute_command(args, run_in_background, output_file, &cmd_count,
-                      &last_cmd_time, &avg_time, &min_time, &max_time);
 
         free_command_args(args);
     }
 
     fclose(output_file);
-
-
-
     free_dangerous_commands();
 
     return 0;
